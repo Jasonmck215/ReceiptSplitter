@@ -142,6 +142,9 @@
                    Example: If they bought 2 Samosas and 1 was voided, output two separate Samosa objects: one with isVoided: false, and one with isVoided: true.
                 6. "uncertain": true if the name or price on that line is blurred, cut off or hard to read. Otherwise false.
                 7. "otherDiscounts": Any discount or saving line that is NOT directly under a single product but IS subtracted before the final total (e.g. multibuy savings, coupons, basket discounts). Absolute values. Do not repeat discounts already recorded against an item. Empty array if none.
+                8. "vatCode": The VAT letter printed beside the item's price (e.g. "A", "Z"). Empty string if none is printed. "discountVatCode": the letter beside its discount line, if any. Discounts in "otherDiscounts" also get a "vatCode".
+                9. "vatRates": From the VAT summary near the bottom, map each VAT letter to its percentage rate (e.g. {"A": 20, "Z": 0}). Empty object if there is no VAT summary.
+                10. "pricesExcludeVat": true ONLY if VAT is added on top of the item prices to reach the final total (e.g. Costco: subtotal + VAT = total). false if item prices already include VAT (e.g. Tesco, Asda).
 
                 Return ONLY a JSON object with this exact structure:
                 {
@@ -154,21 +157,37 @@
                             "originalPrice": 7.99,
                             "discountAmount": 2.00,
                             "discountLabel": "IRC",
+                            "vatCode": "A",
+                            "discountVatCode": "A",
                             "isVoided": false,
                             "uncertain": false
                         }
                     ],
                     "otherDiscounts": [
-                        { "name": "Multibuy saving", "amount": 1.50 }
-                    ]
+                        { "name": "Multibuy saving", "amount": 1.50, "vatCode": "A" }
+                    ],
+                    "vatRates": { "A": 20, "Z": 0 },
+                    "pricesExcludeVat": true
                 }
 
                 Do not include markdown blocks like \`\`\`json. Output ONLY the raw JSON object.
             `;
 
             // Turns the AI output into display lines: products as positive lines, discounts as negative lines.
-            const buildItems = (parsed) => {
-                const out = [];
+            // Returns { items, vatApplied }.
+            // VAT is only added when the receipt lists prices ex VAT (e.g. Costco). This is decided by
+            // checking which version (with or without VAT) actually matches the printed total, with
+            // the AI's "pricesExcludeVat" flag used only as a tie-breaker.
+            const buildItems = (parsed, receiptTotal) => {
+                const rates = { A: 20, Z: 0, ...(parsed.vatRates || {}) };
+                const rateFor = (code) => {
+                    const c = (code || '').toString().trim().toUpperCase();
+                    if (!c) return 0;
+                    const r = Number(rates[c]);
+                    return isNaN(r) ? 0 : r;
+                };
+
+                const raw = [];
                 (parsed.items || [])
                     .filter(item => item.isVoided !== true)
                     .forEach(item => {
@@ -176,15 +195,17 @@
                         const discount = round2(Math.abs(Number(item.discountAmount) || 0));
                         const name = item.name || 'Unnamed item';
                         const parentId = makeId('item');
+                        const rate = rateFor(item.vatCode);
 
-                        out.push({ id: parentId, name, price: original, type: 'item', selectedBy: null, uncertain: !!item.uncertain });
+                        raw.push({ id: parentId, name, net: original, rate, type: 'item', selectedBy: null, uncertain: !!item.uncertain });
 
                         if (discount > 0) {
                             const label = (item.discountLabel || '').trim();
-                            out.push({
+                            raw.push({
                                 id: makeId('disc'),
                                 name: label ? `${label} – ${name}` : `Discount – ${name}`,
-                                price: -discount,
+                                net: -discount,
+                                rate: item.discountVatCode ? rateFor(item.discountVatCode) : rate,
                                 type: 'discount',
                                 parentId,
                                 selectedBy: null,
@@ -197,10 +218,11 @@
                 (parsed.otherDiscounts || []).forEach(d => {
                     const amount = round2(Math.abs(Number(d.amount) || 0));
                     if (amount > 0) {
-                        out.push({
+                        raw.push({
                             id: makeId('disc'),
                             name: d.name || 'Discount',
-                            price: -amount,
+                            net: -amount,
+                            rate: rateFor(d.vatCode),
                             type: 'discount',
                             parentId: null,
                             selectedBy: null,
@@ -210,7 +232,29 @@
                     }
                 });
 
-                return out;
+                const hasVatable = raw.some(r => r.rate > 0);
+                const sumEx = raw.reduce((s, r) => s + r.net, 0);
+                const sumInc = raw.reduce((s, r) => s + r.net * (1 + r.rate / 100), 0);
+
+                let vatApplied = false;
+                if (hasVatable) {
+                    if (receiptTotal > 0) {
+                        const dEx = Math.abs(sumEx - receiptTotal);
+                        const dInc = Math.abs(sumInc - receiptTotal);
+                        vatApplied = Math.abs(dEx - dInc) > 0.05 ? dInc < dEx : parsed.pricesExcludeVat === true;
+                    } else {
+                        vatApplied = parsed.pricesExcludeVat === true;
+                    }
+                }
+
+                const items = raw.map(({ net, rate, ...rest }) => ({
+                    ...rest,
+                    // Kept to 4 dp so the sum matches VAT calculated on the receipt total; displayed to 2 dp
+                    price: vatApplied ? Math.round(net * (1 + rate / 100) * 10000) / 10000 : net,
+                    inclVat: vatApplied && rate > 0
+                }));
+
+                return { items, vatApplied };
             };
 
             const processFile = async (file, order) => {
@@ -239,6 +283,8 @@
                 else if (rawText.startsWith('```')) rawText = rawText.slice(3, -3);
 
                 const parsed = JSON.parse(rawText);
+                const receiptTotal = round2(Number(parsed.receiptTotal) || 0);
+                const { items, vatApplied } = buildItems(parsed, receiptTotal);
 
                 return {
                     id: makeId('receipt'),
@@ -246,9 +292,10 @@
                     fileName: file.name,
                     store: parsed.store && parsed.store !== 'Unknown Store' ? parsed.store : file.name,
                     date: parsed.date || '',
-                    receiptTotal: round2(Number(parsed.receiptTotal) || 0),
+                    receiptTotal,
+                    vatApplied,
                     payer: 'Jason',
-                    items: buildItems(parsed)
+                    items
                 };
             };
 
@@ -486,7 +533,7 @@
                         lines.push('');
                         lines.push(`${g.label} – ${subtotalText}`);
                         items.forEach(i => {
-                            const tag = i.edited ? ' (edited)' : '';
+                            const tag = `${i.inclVat ? ' (incl VAT)' : ''}${i.edited ? ' (edited)' : ''}`;
                             lines.push(`  • ${i.name} – ${fmt(i.price)}${tag}`);
                         });
                     });
@@ -639,6 +686,9 @@
                                                                 <span className={`text-base md:text-sm font-mono font-bold ${isDiscount ? 'text-rose-600' : 'text-slate-600'}`}>
                                                                     {fmt(item.price)}
                                                                 </span>
+                                                                {item.inclVat && (
+                                                                    <span className="text-[10px] text-slate-400 font-medium ml-0.5">incl VAT</span>
+                                                                )}
                                                                 <button onClick={() => startEdit(receipt.id, item.id, item.price, isDiscount)} className="text-slate-400 hover:text-blue-600 p-1" title="Edit price">
                                                                     <PencilIcon />
                                                                 </button>
@@ -678,6 +728,11 @@
                                         </span>
                                         {mismatch && <span className="text-xs font-bold uppercase bg-red-200 px-2 py-1 rounded">Mismatch</span>}
                                     </div>
+                                    {receipt.vatApplied && (
+                                        <div className="mt-2 text-xs font-normal text-slate-500">
+                                            Receipt lists prices ex VAT – VAT has been added to each item at its printed rate.
+                                        </div>
+                                    )}
                                     {mismatch && (
                                         <div className="mt-2 text-xs font-normal">
                                             Calculated is £{Math.abs(mismatch.diff).toFixed(2)} {mismatch.diff > 0 ? 'higher' : 'lower'} than the receipt.
