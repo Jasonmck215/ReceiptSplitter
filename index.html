@@ -9,14 +9,13 @@
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
-<body class="bg-slate-50 min-h-screen p-4 md:p-8">
+<body class="bg-slate-50 min-h-screen p-3 sm:p-4 md:p-8">
     <div id="root"></div>
 
     <script type="text/babel">
         function ReceiptSplitter() {
-            const [items, setItems] = React.useState([]);
+            const [receipts, setReceipts] = React.useState([]);
             const [isLoading, setIsLoading] = React.useState(false);
-            const [payer, setPayer] = React.useState('Jason');
             const [apiKey, setApiKey] = React.useState(localStorage.getItem('gemini_api_key') || '');
             const [isConfigured, setIsConfigured] = React.useState(!!localStorage.getItem('gemini_api_key'));
 
@@ -76,24 +75,24 @@
                     const base64Image = await compressImage(file);
                     
                     const prompt = `
-                        Analyse this UK supermarket receipt (it could be Costco, Tesco, Asda, etc.).
+                        Analyse this UK supermarket receipt (e.g., Costco, Tesco, Asda).
                         Extract the purchased items into a JSON array of objects.
                         
                         CRITICAL RULES FOR COSTCO AND DISCOUNTS:
-                        - If a discount (e.g., "IRC") appears immediately below an item, subtract that discount from the item's price and output the final net price.
-                        - If the receipt indicates an item includes VAT, ensure the price reflects the final cost to the consumer inclusive of that VAT.
-                        - Ignore non-product lines like subtotals, tender amounts, change, or card details.
+                        1. If an item has a discount immediately below it (labeled "IRC", "OFF", or an amount ending in a minus sign like "2.00-Z" or "-2.00"), you MUST mathematically subtract that discount from the item's price.
+                        2. DO NOT output the discount as its own separate line item. Combine them into a single item with the final net price.
+                        Example: If you see "PORK DUMPLINGS 9.99" followed by "IRC PORK & CABBAGE 2.00-Z", you must output a single JSON object: {"name": "PORK DUMPLINGS", "price": 7.99}.
+                        3. If the receipt indicates an item includes VAT, ensure the price reflects the final cost inclusive of that VAT.
+                        4. Ignore subtotals, tender amounts, change, or card details.
                         
                         Each object must have exactly these keys:
-                        - "id": A unique integer starting from 1.
                         - "name": A clean, readable string of the item name.
-                        - "price": The final calculated price of the item (number/float).
+                        - "price": The final calculated net price of the item (number).
                         - "selectedBy": Set this exactly to null.
                         
-                        Do not include markdown blocks like \`\`\`json. Output ONLY the raw JSON array.
+                        Output ONLY the raw JSON array.
                     `;
 
-                    // Using Gemini 3.5 Flash-Lite for high-volume, low-latency requests
                     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${apiKey}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -114,155 +113,223 @@
                     }
                     
                     let rawText = data.candidates[0].content.parts[0].text.trim();
-                    
                     if (rawText.startsWith("```json")) rawText = rawText.slice(7, -3);
                     else if (rawText.startsWith("```")) rawText = rawText.slice(3, -3);
                         
-                    setItems(JSON.parse(rawText));
+                    const parsedItems = JSON.parse(rawText).map((item, index) => ({
+                        ...item,
+                        id: `item-${Date.now()}-${index}`
+                    }));
+
+                    setReceipts([...receipts, {
+                        id: `receipt-${Date.now()}`,
+                        payer: 'Jason',
+                        items: parsedItems
+                    }]);
+                    
                 } catch (error) {
                     console.error("Full Error:", error);
                     alert(`Google API Error: ${error.message}`);
                 } finally {
                     setIsLoading(false);
+                    event.target.value = ''; 
                 }
             };
 
-            const setSelection = (id, person) => {
-                setItems(items.map(item => 
-                    item.id === id ? { ...item, selectedBy: person } : item
+            const setSelection = (receiptId, itemId, person) => {
+                setReceipts(receipts.map(receipt => {
+                    if (receipt.id !== receiptId) return receipt;
+                    return {
+                        ...receipt,
+                        items: receipt.items.map(item => 
+                            item.id === itemId ? { ...item, selectedBy: person } : item
+                        )
+                    };
+                }));
+            };
+
+            const updatePayer = (receiptId, person) => {
+                setReceipts(receipts.map(receipt => 
+                    receipt.id === receiptId ? { ...receipt, payer: person } : receipt
                 ));
             };
 
-            const jasonTotal = items.reduce((sum, item) => {
-                if (item.selectedBy === 'Jason') return sum + item.price;
-                if (item.selectedBy === 'Both') return sum + (item.price / 2);
-                return sum;
-            }, 0);
+            const deleteReceipt = (receiptId) => {
+                if(confirm("Remove this receipt?")) {
+                    setReceipts(receipts.filter(r => r.id !== receiptId));
+                }
+            };
 
-            const scottTotal = items.reduce((sum, item) => {
-                if (item.selectedBy === 'Scott') return sum + item.price;
-                if (item.selectedBy === 'Both') return sum + (item.price / 2);
-                return sum;
-            }, 0);
+            let jasonTotalShare = 0;
+            let scottTotalShare = 0;
+            let jasonTotalPaid = 0;
+            let scottTotalPaid = 0;
+            let grandTotal = 0;
+            let assignedTotal = 0;
 
-            const receiptTotal = items.reduce((sum, item) => sum + item.price, 0);
-            const assignedTotal = jasonTotal + scottTotal;
-            const hasUnassigned = assignedTotal > 0 && assignedTotal < (receiptTotal - 0.05);
+            receipts.forEach(receipt => {
+                let receiptTotal = 0;
+                receipt.items.forEach(item => {
+                    receiptTotal += item.price;
+                    grandTotal += item.price;
+                    
+                    if (item.selectedBy === 'Jason') { jasonTotalShare += item.price; assignedTotal += item.price; }
+                    else if (item.selectedBy === 'Scott') { scottTotalShare += item.price; assignedTotal += item.price; }
+                    else if (item.selectedBy === 'Both') { 
+                        jasonTotalShare += item.price / 2; 
+                        scottTotalShare += item.price / 2; 
+                        assignedTotal += item.price; 
+                    }
+                });
+                
+                if (receipt.payer === 'Jason') jasonTotalPaid += receiptTotal;
+                if (receipt.payer === 'Scott') scottTotalPaid += receiptTotal;
+            });
+
+            const hasUnassigned = assignedTotal > 0 && assignedTotal < (grandTotal - 0.05);
+            const jasonBalance = jasonTotalPaid - jasonTotalShare;
+            const scottBalance = scottTotalPaid - scottTotalShare;
             
             let settlementMessage = "Totals are perfectly balanced.";
-            if (payer === 'Jason' && scottTotal > 0) {
-                settlementMessage = `Scott owes Jason £${scottTotal.toFixed(2)}`;
-            } else if (payer === 'Scott' && jasonTotal > 0) {
-                settlementMessage = `Jason owes Scott £${jasonTotal.toFixed(2)}`;
-            } else if (assignedTotal === 0) {
+            if (jasonBalance > 0.01) {
+                settlementMessage = `Scott owes Jason £${jasonBalance.toFixed(2)}`;
+            } else if (scottBalance > 0.01) {
+                settlementMessage = `Jason owes Scott £${scottBalance.toFixed(2)}`;
+            } else if (assignedTotal === 0 && receipts.length > 0) {
                 settlementMessage = "Assign items to calculate settlement.";
+            } else if (receipts.length === 0) {
+                settlementMessage = "No receipts scanned yet.";
             }
 
             if (!isConfigured) {
                 return (
-                    <div className="max-w-md mx-auto mt-20 bg-white p-8 rounded-xl shadow-sm border border-slate-200 text-center space-y-4">
+                    <div className="max-w-md mx-auto mt-10 md:mt-20 bg-white p-6 md:p-8 rounded-xl shadow-sm border border-slate-200 text-center space-y-4">
                         <h1 className="text-2xl font-bold text-slate-800">Setup Required</h1>
-                        <p className="text-slate-600 text-sm">To run this app in the browser, paste your Gemini API key below. It will be securely saved in your browser's local storage.</p>
+                        <p className="text-slate-600 text-sm">To run this app in the browser, paste your Gemini API key below.</p>
                         <form onSubmit={saveApiKey} className="space-y-4 mt-4">
                             <input 
                                 type="password" 
                                 value={apiKey}
                                 onChange={(e) => setApiKey(e.target.value)}
                                 placeholder="AIzaSy..."
-                                className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500"
+                                className="w-full px-4 py-3 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500"
                                 required
                             />
-                            <button type="submit" className="w-full bg-blue-600 text-white font-medium py-2 rounded-lg hover:bg-blue-700 transition-colors">
-                                Save & Continue
-                            </button>
+                            <button type="submit" className="w-full bg-blue-600 text-white font-bold py-3 rounded-lg hover:bg-blue-700 transition-colors">Save & Continue</button>
                         </form>
                     </div>
                 );
             }
 
             return (
-                <div className="max-w-2xl mx-auto space-y-6">
-                    <div className="text-center relative">
+                <div className="max-w-3xl mx-auto space-y-5 md:space-y-6 pb-12">
+                    <div className="text-center relative pt-4 md:pt-0">
                         <button onClick={resetApiKey} className="absolute right-0 top-0 text-xs text-slate-400 hover:text-slate-600 underline">Reset API Key</button>
-                        <h1 className="text-3xl font-bold text-slate-800">Receipt Splitter</h1>
-                        <p className="text-slate-500 mt-2">Scan a receipt to auto-fill items and calculate shares.</p>
+                        <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Receipt Splitter</h1>
+                        <p className="text-sm md:text-base text-slate-500 mt-2">Scan multiple receipts, assign items, and calculate the final split.</p>
                     </div>
 
-                    <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                        <label className="block text-sm font-medium text-slate-700 mb-2">Upload Receipt Image</label>
-                        <input 
-                            type="file" 
-                            accept="image/*" 
-                            onChange={handleFileUpload}
-                            disabled={isLoading}
-                            className="block w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
-                        />
+                    {/* Upload Section */}
+                    <div className="bg-white p-5 md:p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col items-center justify-center">
+                        <label className="block text-sm font-bold text-slate-700 mb-3 md:mb-4 uppercase tracking-wider text-center">
+                            {receipts.length > 0 ? "+ Add Another Receipt" : "Upload Receipt Image"}
+                        </label>
+                        <div className="relative w-full sm:w-auto">
+                            <input 
+                                type="file" 
+                                accept="image/*" 
+                                onChange={handleFileUpload}
+                                disabled={isLoading}
+                                className="block w-full text-sm text-slate-500 file:mr-4 file:py-3 file:px-6 file:rounded-full file:border-0 file:text-sm file:font-bold file:bg-blue-600 file:text-white hover:file:bg-blue-700 transition-colors cursor-pointer disabled:opacity-50"
+                            />
+                        </div>
                         {isLoading && (
-                            <div className="mt-4 flex items-center text-blue-600">
-                                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                </svg>
+                            <div className="mt-4 flex items-center text-blue-600 font-medium text-sm md:text-base">
+                                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
                                 Analysing with Gemini...
                             </div>
                         )}
                     </div>
 
-                    {items.length > 0 && (
-                        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                            <div className="p-4 bg-slate-50 border-b border-slate-200 grid grid-cols-12 gap-4 font-semibold text-slate-700 text-sm">
+                    {/* Receipts List */}
+                    {receipts.map((receipt, index) => (
+                        <div key={receipt.id} className="bg-white rounded-xl shadow-sm border border-slate-300 overflow-hidden">
+                            <div className="bg-slate-100 p-4 border-b border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                                <h3 className="font-bold text-slate-800 text-lg">Receipt {index + 1}</h3>
+                                <div className="flex items-center space-x-2 md:space-x-3 bg-white px-2 md:px-3 py-1.5 rounded-lg border border-slate-200 shadow-sm w-full sm:w-auto justify-between sm:justify-start">
+                                    <div className="flex items-center">
+                                        <span className="text-xs md:text-sm font-medium text-slate-600 mr-2">Paid by:</span>
+                                        <div className="flex bg-slate-100 rounded p-1">
+                                            <button onClick={() => updatePayer(receipt.id, 'Jason')} className={`px-2 md:px-3 py-1 text-xs font-bold rounded transition-colors ${receipt.payer === 'Jason' ? 'bg-blue-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Jason</button>
+                                            <button onClick={() => updatePayer(receipt.id, 'Scott')} className={`px-2 md:px-3 py-1 text-xs font-bold rounded transition-colors ${receipt.payer === 'Scott' ? 'bg-emerald-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Scott</button>
+                                        </div>
+                                    </div>
+                                    <button onClick={() => deleteReceipt(receipt.id)} className="text-red-400 hover:text-red-600 p-1" title="Delete Receipt">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            {/* Desktop Table Header (Hidden on Mobile) */}
+                            <div className="hidden md:grid p-4 bg-slate-50 border-b border-slate-200 grid-cols-12 gap-4 font-semibold text-slate-700 text-sm">
                                 <div className="col-span-5">Item</div>
                                 <div className="col-span-2 text-right">Price</div>
                                 <div className="col-span-5 text-center">Assign To</div>
                             </div>
+
                             <div className="divide-y divide-slate-100">
-                                {items.map((item) => (
-                                    <div key={item.id} className="p-4 grid grid-cols-12 gap-4 items-center hover:bg-slate-50 transition-colors">
-                                        <div className="col-span-5 text-sm font-medium text-slate-800 break-words">{item.name}</div>
-                                        <div className="col-span-2 text-sm text-right font-mono text-slate-600">£{item.price.toFixed(2)}</div>
-                                        <div className="col-span-5 flex justify-center space-x-1">
-                                            <button onClick={() => setSelection(item.id, 'Jason')} className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${item.selectedBy === 'Jason' ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Jason</button>
-                                            <button onClick={() => setSelection(item.id, 'Both')} className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${item.selectedBy === 'Both' ? 'bg-purple-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Both</button>
-                                            <button onClick={() => setSelection(item.id, 'Scott')} className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${item.selectedBy === 'Scott' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Scott</button>
+                                {receipt.items.map((item) => (
+                                    <div key={item.id} className="p-4 flex flex-col md:grid md:grid-cols-12 gap-3 md:gap-4 md:items-center hover:bg-slate-50 transition-colors">
+                                        
+                                        {/* Mobile: Top Row / Desktop: Left Side */}
+                                        <div className="flex justify-between items-start w-full md:contents">
+                                            <div className="md:col-span-5 text-sm md:text-sm font-medium text-slate-800 break-words pr-4 md:pr-0">
+                                                {item.name}
+                                            </div>
+                                            <div className="md:col-span-2 text-base md:text-sm text-right font-mono font-bold text-slate-600 whitespace-nowrap">
+                                                £{item.price.toFixed(2)}
+                                            </div>
+                                        </div>
+
+                                        {/* Mobile: Bottom Row / Desktop: Right Side */}
+                                        <div className="md:col-span-5 flex justify-between w-full space-x-2 mt-1 md:mt-0">
+                                            <button onClick={() => setSelection(receipt.id, item.id, 'Jason')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Jason' ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Jason</button>
+                                            <button onClick={() => setSelection(receipt.id, item.id, 'Both')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Both' ? 'bg-purple-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Both</button>
+                                            <button onClick={() => setSelection(receipt.id, item.id, 'Scott')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Scott' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Scott</button>
                                         </div>
                                     </div>
                                 ))}
                             </div>
                         </div>
-                    )}
+                    ))}
 
-                    {items.length > 0 && (
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
-                                <h2 className="font-bold text-lg text-slate-800 border-b pb-2">Calculated Shares</h2>
-                                <div className="flex justify-between items-center text-blue-700">
-                                    <span className="font-medium">Jason's Share:</span>
-                                    <span className="font-mono font-bold text-lg">£{jasonTotal.toFixed(2)}</span>
+                    {/* Grand Total Settlement Section */}
+                    {receipts.length > 0 && (
+                        <div className="mt-8 bg-slate-800 p-5 md:p-6 rounded-2xl shadow-xl border border-slate-700 space-y-6 text-white">
+                            <h2 className="font-black text-xl md:text-2xl border-b border-slate-600 pb-3 uppercase tracking-wide text-slate-200 text-center md:text-left">Grand Settlement</h2>
+                            
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div className="bg-slate-700/50 p-4 rounded-xl border border-slate-600">
+                                    <h3 className="text-blue-400 font-bold text-sm uppercase tracking-wider mb-2">Jason's Ledger</h3>
+                                    <div className="flex justify-between text-sm mb-1"><span className="text-slate-300">Target Share:</span> <span className="font-mono font-bold">£{jasonTotalShare.toFixed(2)}</span></div>
+                                    <div className="flex justify-between text-sm"><span className="text-slate-300">Actually Paid:</span> <span className="font-mono font-bold">£{jasonTotalPaid.toFixed(2)}</span></div>
                                 </div>
-                                <div className="flex justify-between items-center text-emerald-700">
-                                    <span className="font-medium">Scott's Share:</span>
-                                    <span className="font-mono font-bold text-lg">£{scottTotal.toFixed(2)}</span>
+                                <div className="bg-slate-700/50 p-4 rounded-xl border border-slate-600">
+                                    <h3 className="text-emerald-400 font-bold text-sm uppercase tracking-wider mb-2">Scott's Ledger</h3>
+                                    <div className="flex justify-between text-sm mb-1"><span className="text-slate-300">Target Share:</span> <span className="font-mono font-bold">£{scottTotalShare.toFixed(2)}</span></div>
+                                    <div className="flex justify-between text-sm"><span className="text-slate-300">Actually Paid:</span> <span className="font-mono font-bold">£{scottTotalPaid.toFixed(2)}</span></div>
                                 </div>
-                                <div className="flex justify-between items-center text-slate-800 pt-2 border-t border-slate-100">
-                                    <span className="font-bold">Assigned Total:</span>
-                                    <span className="font-mono font-bold text-lg">£{assignedTotal.toFixed(2)}</span>
-                                </div>
-                                {hasUnassigned && (
-                                    <p className="text-xs text-amber-600 mt-1">Note: The assigned total is less than the receipt total. Ensure all items are assigned.</p>
-                                )}
                             </div>
 
-                            <div className="bg-slate-800 p-6 rounded-xl shadow-sm space-y-5 text-white">
-                                <h2 className="font-bold text-lg border-b border-slate-600 pb-2">Settlement</h2>
-                                <div className="space-y-2">
-                                    <label className="text-sm font-medium text-slate-300 block mb-2">Who paid at the till?</label>
-                                    <div className="flex p-1 bg-slate-700 rounded-lg">
-                                        <button onClick={() => setPayer('Jason')} className={`flex-1 py-2 text-sm font-medium rounded-md transition-all duration-200 ${payer === 'Jason' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'}`}>Jason Paid</button>
-                                        <button onClick={() => setPayer('Scott')} className={`flex-1 py-2 text-sm font-medium rounded-md transition-all duration-200 ${payer === 'Scott' ? 'bg-emerald-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'}`}>Scott Paid</button>
-                                    </div>
+                            {hasUnassigned && (
+                                <div className="bg-amber-900/40 border border-amber-700/50 text-amber-400 px-4 py-3 rounded-xl text-xs md:text-sm text-center font-medium">
+                                    ⚠ Warning: Some items across your receipts have not been assigned yet.
                                 </div>
-                                <div className="mt-6 pt-4 border-t border-slate-600">
-                                    <div className="text-center font-bold text-xl text-amber-400">{settlementMessage}</div>
+                            )}
+
+                            <div className="pt-4 border-t border-slate-600">
+                                <div className="text-center font-black text-2xl md:text-3xl text-white bg-gradient-to-r from-amber-400 to-orange-400 bg-clip-text text-transparent">
+                                    {settlementMessage}
                                 </div>
                             </div>
                         </div>
