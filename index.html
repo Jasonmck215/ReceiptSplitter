@@ -74,22 +74,24 @@
                 try {
                     const base64Image = await compressImage(file);
                     
+                    // Added a mandatory Scratchpad to force step-by-step mathematical reasoning
                     const prompt = `
                         Analyse this UK supermarket receipt.
-                        Extract the store name, date, and purchased items into a strictly formatted JSON object.
+                        Extract the data strictly as a JSON object. You MUST use the "scratchpad" key to think through the math step-by-step BEFORE outputting the items array.
                         
-                        CRITICAL RULES FOR COSTCO AND DISCOUNTS:
-                        1. Look carefully for discount lines immediately following an item. These often have prices ending in "-Z" (e.g., "1.40-Z") or a minus sign (e.g., "-2.00").
-                        2. If an item is immediately followed by one of these negative values (whether it says "IRC", "OFF", or just a secondary description like "SLICES"), you MUST mathematically subtract that negative amount from the preceding item's price.
-                        3. DO NOT output the discount line as its own separate item. Combine them into a single item with the final net price.
-                        Example: "MEXICANA 750G 6.99" followed by "MEXICANA SLICES 1.40-Z" must become ONE item: {"name": "MEXICANA 750G", "price": 5.59}.
-                        4. Ensure prices reflect the final cost inclusive of VAT.
-                        5. Ignore subtotals, tender amounts, voids, change, or card details.
+                        COSTCO RULEBOOK:
+                        1. RAW LIST: Identify every line item.
+                        2. DISCOUNTS: A discount is immediately below an item, with a price ending in a minus sign (e.g., 2.00-Z). SUBTRACT this from the item above it to get a new net price.
+                        3. VOIDS: A "VOID" line cancels out ONE previous purchase of that exact item. If the voided item had a discount, there is also a VOID for the discount. REMOVE the canceled item and its discount entirely from your list.
+                           *Example: If you see Samosa, Discount, Samosa, Discount, VOID Samosa, VOID Discount -> Only ONE Samosa and ONE Discount remain.
+                        4. MATH CHECK: Add up all your final net prices. It MUST exactly equal the total printed at the bottom of the receipt. If it doesn't, find your mistake in the scratchpad.
                         
                         Return ONLY a JSON object with this exact structure:
                         {
-                            "store": "Name of the store (e.g., Costco, Tesco) or 'Unknown Store'",
+                            "scratchpad": "Step 1: List raw items. Step 2: Combine discounts. Step 3: Remove VOIDs. Step 4: Sum items and check against printed total.",
+                            "store": "Name of the store (e.g., Costco) or 'Unknown Store'",
                             "date": "Date on receipt (e.g., DD/MM/YYYY) or 'Unknown Date'",
+                            "receiptTotal": exactly_the_number_printed_as_the_receipt_total,
                             "items": [
                                 {
                                     "name": "Clean item name",
@@ -102,6 +104,7 @@
                         Do not include markdown blocks like \`\`\`json. Output ONLY the raw JSON object.
                     `;
 
+                    // Using 3.5-flash-lite, but empowering it with Chain-of-Thought
                     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${apiKey}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -135,6 +138,7 @@
                         id: `receipt-${Date.now()}`,
                         store: parsedData.store || `Receipt ${receipts.length + 1}`,
                         date: parsedData.date || '',
+                        receiptTotal: parsedData.receiptTotal || 0,
                         payer: 'Jason',
                         items: parsedItems
                     }]);
@@ -262,55 +266,66 @@
                         )}
                     </div>
 
-                    {receipts.map((receipt) => (
-                        <div key={receipt.id} className="bg-white rounded-xl shadow-sm border border-slate-300 overflow-hidden">
-                            <div className="bg-slate-100 p-4 border-b border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-                                <h3 className="font-bold text-slate-800 text-lg uppercase tracking-wide">
-                                    {receipt.store} {receipt.date && receipt.date !== 'Unknown Date' ? `- ${receipt.date}` : ''}
-                                </h3>
-                                <div className="flex items-center space-x-2 md:space-x-3 bg-white px-2 md:px-3 py-1.5 rounded-lg border border-slate-200 shadow-sm w-full sm:w-auto justify-between sm:justify-start">
-                                    <div className="flex items-center">
-                                        <span className="text-xs md:text-sm font-medium text-slate-600 mr-2">Paid by:</span>
-                                        <div className="flex bg-slate-100 rounded p-1">
-                                            <button onClick={() => updatePayer(receipt.id, 'Jason')} className={`px-2 md:px-3 py-1 text-xs font-bold rounded transition-colors ${receipt.payer === 'Jason' ? 'bg-blue-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Jason</button>
-                                            <button onClick={() => updatePayer(receipt.id, 'Scott')} className={`px-2 md:px-3 py-1 text-xs font-bold rounded transition-colors ${receipt.payer === 'Scott' ? 'bg-emerald-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Scott</button>
+                    {receipts.map((receipt) => {
+                        const calculatedTotal = receipt.items.reduce((sum, item) => sum + item.price, 0);
+                        const isMismatch = Math.abs(calculatedTotal - receipt.receiptTotal) > 0.05;
+
+                        return (
+                            <div key={receipt.id} className="bg-white rounded-xl shadow-sm border border-slate-300 overflow-hidden">
+                                <div className="bg-slate-100 p-4 border-b border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                                    <h3 className="font-bold text-slate-800 text-lg uppercase tracking-wide">
+                                        {receipt.store} {receipt.date && receipt.date !== 'Unknown Date' ? `- ${receipt.date}` : ''}
+                                    </h3>
+                                    <div className="flex items-center space-x-2 md:space-x-3 bg-white px-2 md:px-3 py-1.5 rounded-lg border border-slate-200 shadow-sm w-full sm:w-auto justify-between sm:justify-start">
+                                        <div className="flex items-center">
+                                            <span className="text-xs md:text-sm font-medium text-slate-600 mr-2">Paid by:</span>
+                                            <div className="flex bg-slate-100 rounded p-1">
+                                                <button onClick={() => updatePayer(receipt.id, 'Jason')} className={`px-2 md:px-3 py-1 text-xs font-bold rounded transition-colors ${receipt.payer === 'Jason' ? 'bg-blue-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Jason</button>
+                                                <button onClick={() => updatePayer(receipt.id, 'Scott')} className={`px-2 md:px-3 py-1 text-xs font-bold rounded transition-colors ${receipt.payer === 'Scott' ? 'bg-emerald-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Scott</button>
+                                            </div>
                                         </div>
+                                        <button onClick={() => deleteReceipt(receipt.id)} className="text-red-400 hover:text-red-600 p-1" title="Delete Receipt">
+                                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                                        </button>
                                     </div>
-                                    <button onClick={() => deleteReceipt(receipt.id)} className="text-red-400 hover:text-red-600 p-1" title="Delete Receipt">
-                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
-                                    </button>
+                                </div>
+                                
+                                <div className="hidden md:grid p-4 bg-slate-50 border-b border-slate-200 grid-cols-12 gap-4 font-semibold text-slate-700 text-sm">
+                                    <div className="col-span-5">Item</div>
+                                    <div className="col-span-2 text-right">Price</div>
+                                    <div className="col-span-5 text-center">Assign To</div>
+                                </div>
+
+                                <div className="divide-y divide-slate-100">
+                                    {receipt.items.map((item) => (
+                                        <div key={item.id} className="p-4 flex flex-col md:grid md:grid-cols-12 gap-3 md:gap-4 md:items-center hover:bg-slate-50 transition-colors">
+                                            
+                                            <div className="flex justify-between items-start w-full md:contents">
+                                                <div className="md:col-span-5 text-sm md:text-sm font-medium text-slate-800 break-words pr-4 md:pr-0">
+                                                    {item.name}
+                                                </div>
+                                                <div className="md:col-span-2 text-base md:text-sm text-right font-mono font-bold text-slate-600 whitespace-nowrap">
+                                                    £{item.price.toFixed(2)}
+                                                </div>
+                                            </div>
+
+                                            <div className="md:col-span-5 flex justify-between w-full space-x-2 mt-1 md:mt-0">
+                                                <button onClick={() => setSelection(receipt.id, item.id, 'Jason')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Jason' ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Jason</button>
+                                                <button onClick={() => setSelection(receipt.id, item.id, 'Both')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Both' ? 'bg-purple-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Both</button>
+                                                <button onClick={() => setSelection(receipt.id, item.id, 'Scott')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Scott' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Scott</button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+
+                                <div className={`p-4 text-sm font-medium flex justify-between items-center ${isMismatch ? 'bg-red-50 text-red-700 border-t border-red-200' : 'bg-slate-50 text-slate-500 border-t border-slate-200'}`}>
+                                    <span>Calculated Total: £{calculatedTotal.toFixed(2)}</span>
+                                    <span>Receipt Total: £{receipt.receiptTotal.toFixed(2)}</span>
+                                    {isMismatch && <span className="text-xs font-bold uppercase ml-2 bg-red-200 px-2 py-1 rounded">Mismatch</span>}
                                 </div>
                             </div>
-                            
-                            <div className="hidden md:grid p-4 bg-slate-50 border-b border-slate-200 grid-cols-12 gap-4 font-semibold text-slate-700 text-sm">
-                                <div className="col-span-5">Item</div>
-                                <div className="col-span-2 text-right">Price</div>
-                                <div className="col-span-5 text-center">Assign To</div>
-                            </div>
-
-                            <div className="divide-y divide-slate-100">
-                                {receipt.items.map((item) => (
-                                    <div key={item.id} className="p-4 flex flex-col md:grid md:grid-cols-12 gap-3 md:gap-4 md:items-center hover:bg-slate-50 transition-colors">
-                                        
-                                        <div className="flex justify-between items-start w-full md:contents">
-                                            <div className="md:col-span-5 text-sm md:text-sm font-medium text-slate-800 break-words pr-4 md:pr-0">
-                                                {item.name}
-                                            </div>
-                                            <div className="md:col-span-2 text-base md:text-sm text-right font-mono font-bold text-slate-600 whitespace-nowrap">
-                                                £{item.price.toFixed(2)}
-                                            </div>
-                                        </div>
-
-                                        <div className="md:col-span-5 flex justify-between w-full space-x-2 mt-1 md:mt-0">
-                                            <button onClick={() => setSelection(receipt.id, item.id, 'Jason')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Jason' ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Jason</button>
-                                            <button onClick={() => setSelection(receipt.id, item.id, 'Both')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Both' ? 'bg-purple-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Both</button>
-                                            <button onClick={() => setSelection(receipt.id, item.id, 'Scott')} className={`flex-1 md:flex-none px-2 py-2 md:py-1.5 md:px-3 text-xs md:text-sm font-medium rounded-md transition-colors ${item.selectedBy === 'Scott' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>Scott</button>
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    ))}
+                        );
+                    })}
 
                     {receipts.length > 0 && (
                         <div className="mt-8 bg-slate-800 p-5 md:p-6 rounded-2xl shadow-xl border border-slate-700 space-y-6 text-white">
