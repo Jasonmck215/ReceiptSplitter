@@ -78,21 +78,17 @@
                         Analyse this UK supermarket receipt.
                         Extract the store name, date, and purchased items into a strictly formatted JSON object.
                         
-                        CRITICAL RULES FOR COSTCO RECEIPTS:
-                        1. VOIDS: Completely ignore any line starting with "VOID" and also ignore the reversed discount line immediately below it.
-                        2. IDENTIFYING DISCOUNTS: Any line where the final price ends in a minus sign (like "2.00-Z", "1.40-Z", or "-2.00") is a discount. 
-                        3. APPLYING DISCOUNTS: You MUST subtract this discount amount from the product immediately above it. NEVER list the discount as its own separate item.
-                        
-                        EXAMPLES OF COMBINING:
-                        - "MEXICANA 750G 6.99" followed by "MEXICANA SLICES 1.40-Z" -> Output ONE item: {"name": "MEXICANA 750G", "price": 5.59}
-                        - "LMB/CK SAMOSA 960G 7.99 Z" followed by "CAFE ASIA SAMOSA 2.00-Z" -> Output ONE item: {"name": "LMB/CK SAMOSA 960G", "price": 5.59}
-                        
+                        CRITICAL RULES FOR COSTCO AND DISCOUNTS:
+                        1. Look carefully for discount lines immediately following an item. These often have prices ending in "-Z" (e.g., "1.40-Z") or a minus sign (e.g., "-2.00").
+                        2. If an item is immediately followed by one of these negative values (whether it says "IRC", "OFF", or just a secondary description like "SLICES"), you MUST mathematically subtract that negative amount from the preceding item's price.
+                        3. DO NOT output the discount line as its own separate item. Combine them into a single item with the final net price.
+                        Example: "MEXICANA 750G 6.99" followed by "MEXICANA SLICES 1.40-Z" must become ONE item: {"name": "MEXICANA 750G", "price": 5.59}.
                         4. Ensure prices reflect the final cost inclusive of VAT.
-                        5. Ignore subtotals, tender amounts, change, or card details.
+                        5. Ignore subtotals, tender amounts, voids, change, or card details.
                         
                         Return ONLY a JSON object with this exact structure:
                         {
-                            "store": "Name of the store (e.g., Costco) or 'Unknown Store'",
+                            "store": "Name of the store (e.g., Costco, Tesco) or 'Unknown Store'",
                             "date": "Date on receipt (e.g., DD/MM/YYYY) or 'Unknown Date'",
                             "items": [
                                 {
